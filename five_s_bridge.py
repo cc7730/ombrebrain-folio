@@ -1,9 +1,7 @@
 """5s bridge routes for Ombre Brain.
 
-The module is registered automatically by ``sitecustomize.py`` when
-``server.py`` creates its FastMCP instance.  Keeping the bridge in a separate
-module lets the feature live on an isolated branch without touching the large
-upstream server file.
+The bridge exposes a server-side recall pipeline for CanCanPhone:
+keyword recall + lexical fallback + vector recall + LLM rerank + prompt injection.
 """
 
 from __future__ import annotations
@@ -44,7 +42,12 @@ def _clean_text(value: Any, limit: int = 1800) -> str:
     return text[:limit]
 
 
-def _normalise_candidate(bucket: dict[str, Any], *, keyword_score: float = 0.0, vector_score: float = 0.0) -> dict[str, Any] | None:
+def _normalise_candidate(
+    bucket: dict[str, Any],
+    *,
+    keyword_score: float = 0.0,
+    vector_score: float = 0.0,
+) -> dict[str, Any] | None:
     meta = bucket.get("metadata") or {}
     if _is_hidden(meta):
         return None
@@ -54,7 +57,6 @@ def _normalise_candidate(bucket: dict[str, Any], *, keyword_score: float = 0.0, 
     name = _clean_text(meta.get("name") or bucket.get("id", ""), 180)
     importance = _clamp_int(meta.get("importance", 5), 5, 1, 10)
 
-    # keyword scores are normally 0..100 while cosine similarity is 0..1.
     keyword_norm = max(0.0, min(float(keyword_score or 0.0) / 100.0, 1.0))
     vector_norm = max(0.0, min(float(vector_score or 0.0), 1.0))
     retrieval_score = max(keyword_norm, vector_norm)
@@ -82,6 +84,94 @@ def _merge_candidate(target: dict[str, Any], incoming: dict[str, Any]) -> None:
     target["vector_score"] = max(float(target.get("vector_score", 0)), float(incoming.get("vector_score", 0)))
     target["retrieval_score"] = max(target["keyword_score"], target["vector_score"])
     target["fallback_score"] = target["retrieval_score"] * (0.8 + int(target.get("importance", 5)) / 25.0)
+
+
+def _bridge_tokens(bucket_mgr: Any, query: str) -> list[str]:
+    """Tokenize natural-language queries for lexical fallback.
+
+    BucketManager already has Chinese-aware tokenisation (jieba + n-grams), so
+    reuse it when available. A conservative fallback keeps this bridge usable
+    even if the private helper changes upstream.
+    """
+    try:
+        tokens = list(bucket_mgr._split_query_tokens(query))
+    except Exception:
+        tokens = []
+
+    if not tokens:
+        tokens.extend(re.findall(r"[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,8}", query or ""))
+
+    # Preserve order, drop generic glue words that create noisy candidates.
+    stop = {
+        "应该", "怎么", "如何", "平时", "时候", "可以", "什么", "这个", "那个",
+        "我们", "你们", "他们", "用户", "一下", "进行", "当前", "现在",
+    }
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in tokens:
+        token = str(raw or "").strip().lower()
+        if len(token) < 2 or token in stop or token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result[:32]
+
+
+async def _lexical_fallback(
+    bucket_mgr: Any,
+    query: str,
+    limit: int,
+) -> list[tuple[dict[str, Any], float]]:
+    """Recall buckets by token overlap when long fuzzy queries miss.
+
+    This is intentionally a recall-only stage. It may be generous because the
+    downstream reranker decides which candidates are actually injected.
+    """
+    tokens = _bridge_tokens(bucket_mgr, query)
+    if not tokens:
+        return []
+
+    try:
+        buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as exc:
+        LOGGER.warning("5s lexical fallback list failed: %s", exc)
+        return []
+
+    ranked: list[tuple[dict[str, Any], float]] = []
+    for bucket in buckets:
+        meta = bucket.get("metadata") or {}
+        if _is_hidden(meta):
+            continue
+
+        fields = [
+            (_clean_text(meta.get("name", ""), 300).lower(), 3.0),
+            (" ".join(str(x) for x in (meta.get("domain") or [])).lower(), 2.5),
+            (" ".join(str(x) for x in (meta.get("tags") or [])).lower(), 2.0),
+            (_clean_text(meta.get("summary", ""), 700).lower(), 1.5),
+            (_clean_text(bucket.get("content", ""), 5000).lower(), 1.0),
+        ]
+
+        weighted_hits = 0.0
+        unique_hits: set[str] = set()
+        for token in tokens:
+            best_weight = 0.0
+            for field_text, weight in fields:
+                if token and token in field_text:
+                    best_weight = max(best_weight, weight)
+            if best_weight:
+                unique_hits.add(token)
+                weighted_hits += best_weight
+
+        if not unique_hits:
+            continue
+
+        coverage = len(unique_hits) / max(1, len(tokens))
+        # 1 strong title hit or several body hits should enter the candidate set.
+        score = min(100.0, weighted_hits * 20.0 + coverage * 20.0)
+        ranked.append((bucket, score))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked[:limit]
 
 
 def _extract_ids(raw_text: str, allowed_ids: set[str], top_k: int) -> list[str]:
@@ -252,6 +342,18 @@ def register_five_s_bridge(mcp: Any, namespace: dict[str, Any]) -> bool:
             if not candidate or not candidate["id"]:
                 continue
             merged[candidate["id"]] = candidate
+
+        # Long natural-language queries can miss the upstream fuzzy threshold.
+        # Add a generous token-overlap recall stage, then let reranker decide.
+        lexical_hits = await _lexical_fallback(bucket_mgr, query, candidate_limit)
+        for bucket, lexical_score in lexical_hits:
+            candidate = _normalise_candidate(bucket, keyword_score=lexical_score)
+            if not candidate or not candidate["id"]:
+                continue
+            if candidate["id"] in merged:
+                _merge_candidate(merged[candidate["id"]], candidate)
+            else:
+                merged[candidate["id"]] = candidate
 
         if embedding_engine is not None and getattr(embedding_engine, "enabled", False):
             try:

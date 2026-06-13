@@ -16,10 +16,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files / 复制项目文件
-COPY *.py .
+COPY *.py ./
 COPY dashboard.html .
 COPY v2/ ./v2/
 COPY config.example.yaml ./config.yaml
+
+# Put /app on PYTHONPATH before interpreter startup so sitecustomize.py can
+# register the branch-local 5s bridge without modifying upstream server.py.
+ENV PYTHONPATH=/app
 
 # Persistent mount point: bucket data
 # 持久化挂载点：记忆数据

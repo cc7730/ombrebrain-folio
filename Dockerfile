@@ -21,10 +21,6 @@ COPY dashboard.html .
 COPY v2/ ./v2/
 COPY config.example.yaml ./config.yaml
 
-# Put /app on PYTHONPATH before interpreter startup so sitecustomize.py can
-# register the branch-local 5s bridge without modifying upstream server.py.
-ENV PYTHONPATH=/app
-
 # Persistent mount point: bucket data
 # 持久化挂载点：记忆数据
 VOLUME ["/app/buckets"]
@@ -42,4 +38,5 @@ ENV OMBRE_BUCKETS_DIR=/app/buckets
 
 EXPOSE 8000
 
-CMD ["python", "server.py"]
+# Branch wrapper registers POST /api/5s/recall, then executes upstream server.py.
+CMD ["python", "five_s_bootstrap.py"]
